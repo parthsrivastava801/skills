@@ -1,231 +1,222 @@
 ---
-name: live-session-auditor
+name: ssr-hydration-watchdog
 description: >
-  Catches two classes of frontend bugs that are completely invisible in source
-  code and can only be observed by running the app in a real browser session.
-  Use this skill whenever the user mentions: hydration mismatches, page flashing
-  on load, SSR/CSR content differences, "different content on first load",
-  Next.js/Nuxt/Remix/SvelteKit hydration errors, white screen flashes, or any
-  SSR bug. ALSO use whenever the user asks about GDPR compliance, consent
-  auditing, "what fires before consent", cookie compliance, tracking scripts,
-  analytics firing too early, pre-consent pixels, or "is my tracking compliant".
-  Use proactively if the user's app is SSR-based AND has any analytics/tracking
-  scripts — both phases are useful even when the user hasn't explicitly asked.
+  Detects SSR hydration mismatches by running the app in a real browser and
+  comparing the server-rendered HTML against the post-hydration DOM. Use this
+  skill whenever the user mentions: hydration mismatch, hydration error, hydration
+  failed, page flashing on load, content shifting after load, white screen on first
+  render, different content on refresh, "Expected server HTML", Next.js hydration,
+  Nuxt hydration, Remix hydration, SvelteKit hydration, SSR bug, server-client
+  mismatch, or "my page looks different the first time". Also use proactively when
+  the user is debugging a visual flicker or layout shift in an SSR app and cannot
+  find the cause in the code — hydration is the likely culprit. Supports two modes:
+  single-URL (when the user gives a specific route to check) and full-scan (when
+  the user says "scan my app", "check all my routes", "audit my whole site", or
+  does not name a specific URL).
 ---
 
-# Live Session Auditor
+# SSR Hydration Watchdog
 
-You are running a two-phase browser audit that catches bugs no linter,
-code reviewer, or static analysis tool can find. Both problems only exist
-at runtime — in network traffic and DOM state at specific milliseconds.
+You are detecting bugs that are completely invisible in source code. A hydration
+mismatch happens when the HTML your server produces does not match the HTML the
+browser produces after JavaScript runs. React, Vue, Nuxt, and other SSR frameworks
+try to reuse the server HTML rather than rebuilding the DOM from scratch — if the
+two versions disagree, the framework either patches the DOM (causing a visual
+flash) or throws a warning that most developers never see.
 
-## What this skill does
-
-**Phase 1 — SSR Hydration Watchdog**
-Loads the page, captures React/Vue/Nuxt hydration errors from the browser
-console, diffs the server-rendered HTML against the post-hydration DOM, and
-traces every mismatch back to its component and root cause (localStorage
-read, window access, non-deterministic value like Date.now() called on render).
-
-**Phase 2 — Consent & Tracking Fire Order Auditor**
-Loads the page with all consent blocked, intercepts every outbound network
-request, categorises each by vendor (GA4, Meta Pixel, HotJar, etc.), then
-accepts consent and captures the second wave. Produces a per-vendor GDPR
-compliance verdict — fired before consent = violation, fired after = compliant.
-
-Both phases run in one Playwright browser process to share startup cost.
+The only way to catch this is to run the app, capture the HTML at the exact
+millisecond before JavaScript executes, then capture it again after hydration
+completes, and compare the two.
 
 ---
 
-## Step 0 — Gather context before touching any files
+## Step 0 — Understand the request and pick a mode
 
-Ask the user (or infer from the codebase) before proceeding:
+**Single-URL mode** — the user gives a specific route or URL:
+> "check hydration on /dashboard", "audit http://localhost:3000/login"
 
-1. **Target URL** — default `http://localhost:3000`. Ask if unsure.
-2. **Framework** — Next.js, Nuxt, Remix, SvelteKit, or other SSR framework.
-   If the app has no SSR (plain CRA, Vite SPA), skip Phase 1 and say why.
-3. **Consent banner** — Does the page show a cookie/consent banner?
-   If yes: what does the "Accept" button say, or is there a CSS selector for it?
-   If no consent banner exists but tracking requests fire, that itself is a
-   GDPR violation — Phase 2 still runs and will report it.
-4. **Dev server** — Confirm it's running before proceeding. If not, provide
-   the start command for their framework:
-   - Next.js: `npm run dev`
-   - Nuxt: `npm run dev`
-   - Remix: `npm run dev`
-   - SvelteKit: `npm run dev`
+**Full-scan mode** — the user asks generally:
+> "scan my app", "check all my routes", "audit my whole site",
+> "find all hydration issues", or gives no specific URL
+
+If the mode is unclear, ask exactly one question: "Do you want to check a
+specific URL, or scan all routes in the project?"
+
+In either mode, confirm:
+1. **Dev server URL** — default `http://localhost:3000`. Ask if different.
+2. **Framework** — Next.js, Nuxt, Remix, SvelteKit, or other. Infer from
+   `package.json` if available before asking.
+
+If the dev server is not running, provide the start command and wait for
+confirmation before proceeding.
 
 ---
 
-## Step 1 — Check and install Playwright
-
-Run this check first:
+## Step 1 — Check Playwright
 
 ```bash
 npx playwright --version 2>/dev/null || echo "NOT_INSTALLED"
 ```
 
 If not installed:
-
 ```bash
-npm install -D playwright
-npx playwright install chromium
-```
-
-If the user can't modify package.json (e.g. they're on a shared system):
-
-```bash
-npm install -g playwright
-npx playwright install chromium
+npm install -D playwright && npx playwright install chromium
 ```
 
 ---
 
-## Step 2 — Write the audit script
+## Step 2 — Discover routes (full-scan mode only)
 
-Create `live-audit.mjs` in the project root. Populate CONFIG from Step 0.
-Read `scripts/audit-runner.mjs` from this skill's directory for the full
-script — copy it verbatim, then update only the CONFIG block at the top.
+Skip this step entirely in single-URL mode.
+
+Read `references/route-discovery.md` for the exact glob patterns per framework.
+Build the route list from the filesystem — do not ask the user to list routes
+manually. Use these roots:
+
+| Framework  | Route root            | Pattern                        |
+|------------|-----------------------|--------------------------------|
+| Next.js    | `app/` or `pages/`   | `**/page.tsx`, `**/page.js`, `**/*.tsx` (pages dir) |
+| Nuxt       | `pages/`             | `**/*.vue`                     |
+| Remix      | `app/routes/`        | `**/*.tsx`, `**/*.jsx`         |
+| SvelteKit  | `src/routes/`        | `**/+page.svelte`              |
+
+Convert file paths to URL paths (strip `page.tsx`, replace `[param]` with
+`_test`, replace `(group)` folders with nothing). Cap full-scan at 30 routes —
+if more exist, ask the user if they want to proceed or filter by directory.
+
+---
+
+## Step 3 — Write and configure the check script
+
+Copy `scripts/hydration-check.mjs` from this skill to the project root.
+Fill in the CONFIG block only — leave everything else untouched:
 
 ```js
-// CONFIG — edit these values only
 const CONFIG = {
-  url:               'http://localhost:3000',  // target URL
-  framework:         'nextjs',                  // nextjs | nuxt | remix | sveltekit | other
-  consentButtonText: 'Accept',                  // button text, or null if no banner
-  consentSelector:   null,                      // CSS override, e.g. '#accept-all'
-  waitAfterConsent:  2000,                      // ms to wait after clicking consent
-  headless:          true,                      // set false to watch it run
+  baseUrl:    'http://localhost:3000',   // dev server root
+  framework:  'nextjs',                  // nextjs | nuxt | remix | sveltekit | other
+  mode:       'single',                  // 'single' | 'scan'
+  singleUrl:  '/dashboard',             // used in single mode only
+  routes:     [],                        // populated by Claude in scan mode
+  headless:   true,                      // set false to watch it run
 };
 ```
 
-See `references/vendor-patterns.md` for the full vendor fingerprint list used
-in Phase 2 — add custom vendors there if the user's stack has internal tools.
-
----
-
-## Step 3 — Run the audit
-
-```bash
-node live-audit.mjs
-```
-
-The script exits `0` on clean, `1` on any violation — safe to use as a CI gate.
-
-To watch it run in a real browser window:
-```bash
-HEADLESS=false node live-audit.mjs
-```
-
-To see the full HTML diff in Phase 1 (verbose):
-```bash
-VERBOSE=1 node live-audit.mjs
+In scan mode, populate `routes` with the list discovered in Step 2:
+```js
+routes: ['/', '/login', '/dashboard', '/settings/profile'],
 ```
 
 ---
 
-## Step 4 — Interpret Phase 1 results (Hydration)
+## Step 4 — Run it
 
-**No errors reported → clean.** Nothing to fix.
+```bash
+node hydration-check.mjs
+```
 
-**Hydration error from console** — React/Vue/Nuxt log the mismatch component
-in the error message. Open that component and look for these root causes:
+To watch the browser:
+```bash
+HEADLESS=false node hydration-check.mjs
+```
 
-| Root cause | Fix |
-|---|---|
-| `localStorage` / `sessionStorage` read on render | Move into `useEffect`, or use `useLayoutEffect` with a mounted guard |
-| `window`, `document`, `navigator` accessed directly | Wrap in `typeof window !== 'undefined'` check, or use dynamic import with `ssr: false` |
-| `Date.now()`, `new Date()`, `Math.random()` on render | Move to `useEffect` or generate server-side and pass as prop |
-| `crypto.randomUUID()` on render | Same as above |
-| `useSearchParams()` without Suspense boundary (Next.js) | Wrap the component in `<Suspense>` |
-| Browser extension injecting DOM nodes | Not your bug — note it in the report |
+To see the raw HTML diff for a specific failure:
+```bash
+VERBOSE=1 node hydration-check.mjs
+```
 
-**Structural DOM diff without console error** — the diff shows what changed.
-Look at which element's text or attribute differs between server and client HTML.
-The cause is almost always one of the above — trace it to the component that
-owns that element.
+Script exits `0` when all routes are clean, `1` when any mismatch is found.
 
 ---
 
-## Step 5 — Interpret Phase 2 results (Consent)
+## Step 5 — Interpret results and identify root causes
 
-**No consent banner + no tracking requests → clean.**
+For each route flagged, read the error text and match it to a root cause.
+Read `references/root-cause-fixes.md` for the full lookup table — it maps
+every known error pattern to a root cause and an exact fix.
 
-**No consent banner + tracking requests present:**
-This is a GDPR violation. The user is firing tracking without any consent
-mechanism at all. Recommend adding a consent management platform (CMP).
+**Quick reference for the most common causes:**
 
-**Vendors listed as violations (fired before consent):**
-For each violating vendor, find where its script loads:
-- `<Script>` tags in `_app.tsx` / `layout.tsx` / `<head>`
-- Google Tag Manager container (check if GTM fires tags without consent triggers)
-- Third-party components that auto-initialise
+| What the error says | Root cause | Fix |
+|---|---|---|
+| `localStorage` / `sessionStorage` | Browser-only API read on render | Move into `useEffect` with mounted guard |
+| `window` / `document` / `navigator` | Browser-only global on render | Wrap in `typeof window !== 'undefined'` check |
+| `new Date()` / `Date.now()` | Non-deterministic value differs between server and client | Generate server-side and pass as prop, or move to `useEffect` |
+| `Math.random()` | Non-deterministic | Move to `useEffect` or generate in server component |
+| `crypto.randomUUID()` | Non-deterministic | Same as Math.random() |
+| `useSearchParams()` without Suspense | Next.js App Router constraint | Wrap component in `<Suspense>` |
+| No console error but DOM diff exists | Silent mismatch — browser extension or conditional render | Check for `typeof window` conditionals that render different JSX |
+| Nuxt: `[nuxt] [warn] Hydration mismatch` | Same root causes, different logger | Same fixes apply |
 
-Apply the appropriate fix:
-
-| Vendor type | Fix |
-|---|---|
-| `<script>` tag | Wrap load in consent callback: only append to DOM after consent event fires |
-| Next.js `<Script>` | Add `strategy="lazyOnload"` + consent gate |
-| Google Tag Manager | Add consent mode v2 triggers; set default state to `denied` |
-| React component with auto-init | Accept `enabled` prop, pass `consentGiven` state |
-
-**Vendors listed as compliant (fired after consent):** No action needed.
-Confirm with the user that all expected vendors appear in this list.
+For anything not in the quick reference, read `references/root-cause-fixes.md`.
 
 ---
 
 ## Step 6 — Deliver the report
 
-After interpreting results, always output this structured summary:
+**Single-URL mode:**
 
 ```
-═══════════════════════════════════════════════
-  LIVE SESSION AUDIT — [URL] — [timestamp]
-═══════════════════════════════════════════════
+SSR HYDRATION WATCHDOG
+══════════════════════════════════════════════
+Route   : /dashboard
+Status  : ❌  1 mismatch found
 
-PHASE 1 · SSR HYDRATION
-  Status : ✅ Clean  |  ❌ [N] issue(s) found
+  Issue 1
+  ───────
+  Cause   : localStorage read on render (UserGreeting component)
+  Evidence: "Warning: Prop `children` did not match. Server: "Welcome"
+             Client: "Welcome, Parth""
+  Fix     : Move localStorage.getItem('name') into useEffect with
+             a mounted state guard. Render "Welcome" on server,
+             update to "Welcome, [name]" after mount.
 
-  [If issues:]
-  Issue 1 · Component: [name]
-            Cause    : [root cause from table above]
-            Fix      : [specific fix for their code]
-
-PHASE 2 · CONSENT & TRACKING
-  Status : ✅ Compliant  |  ❌ [N] violation(s)
-
-  Violations (fired BEFORE consent):
-    🔴  [Vendor name] — [URL pattern that triggered it]
-
-  Compliant (fired AFTER consent):
-    🟢  [Vendor name]
-
-  No consent mechanism detected: [yes / no]
-
-NEXT STEPS (priority order)
-  1. [Most severe fix first]
-  2. ...
-═══════════════════════════════════════════════
+  Code change needed in: components/UserGreeting.tsx
+══════════════════════════════════════════════
 ```
+
+**Full-scan mode:**
+
+```
+SSR HYDRATION WATCHDOG — FULL SCAN
+══════════════════════════════════════════════
+Routes scanned : 12
+Clean          : 10  ✅
+Issues found   :  2  ❌
+
+❌  /dashboard     — localStorage read (UserGreeting)
+❌  /profile       — window.innerWidth read on render (ResponsivePanel)
+✅  /login
+✅  /settings
+✅  /settings/profile
+... (remaining clean routes)
+
+Fix 1 — /dashboard
+  [same detail format as single-URL]
+
+Fix 2 — /profile
+  [same detail format]
+══════════════════════════════════════════════
+```
+
+Always end the report with the list of clean routes so the user can confirm
+coverage, not just failures.
 
 ---
 
 ## CI integration
 
-Once the app is clean, suggest adding this to their CI pipeline:
+After the app is clean, suggest adding to CI:
 
 ```yaml
-# .github/workflows/live-audit.yml
+# .github/workflows/hydration.yml
 - name: Start dev server
   run: npm run dev &
 - name: Wait for server
   run: npx wait-on http://localhost:3000
-- name: Run live session audit
-  run: node live-audit.mjs
+- name: Hydration check
+  run: node hydration-check.mjs
 ```
-
-The `1` exit code on failure will block PRs automatically.
 
 ---
 
@@ -233,10 +224,11 @@ The `1` exit code on failure will block PRs automatically.
 
 | Situation | Action |
 |---|---|
-| App requires login to reach audit target | Ask user for a public route, or offer to add `storageState` cookie injection |
-| Playwright browser crashes | Try `headless: false` to diagnose; check if app throws uncaught errors on load |
-| Timeout on `networkidle` | App may have long-polling or WebSocket — add `timeout: 30000` to `waitForLoadState` |
-| SPA with no SSR (Vite, CRA) | Skip Phase 1, explain hydration only applies to SSR. Run Phase 2 only. |
-| Nuxt 3 hydration errors look different | Use `[nuxt] [warn] Hydration mismatch` pattern — already in the script |
-| User is on Windows | Script uses ES modules — Node 18+ required. Check with `node --version` |
-| Consent button not found | Log a warning but continue; report "consent UI not detected" in output |
+| Framework is a plain SPA (Vite, CRA) | Tell the user hydration mismatches cannot exist without SSR. Offer to run the live-session-auditor consent check instead. |
+| Route requires auth | Skip it in scan mode and list it as "skipped — requires login". Offer to add cookie injection if the user wants it audited. |
+| Route has a dynamic segment e.g. `/post/[id]` | Substitute a real ID if the user can provide one; otherwise substitute `1` and note the assumption in the report. |
+| No hydration errors but visual flash reported | Run with `VERBOSE=1` — silent mismatches show in the DOM diff even without a console error. Also check for `suppressHydrationWarning` prop hiding errors. |
+| `suppressHydrationWarning` found in codebase | Flag every instance in the report. This prop hides mismatches rather than fixing them — each use should be reviewed. |
+| Browser extension modifies DOM | The diff will show changes not attributable to any component. Note in the report that extensions can cause false positives and suggest running in an Incognito window. |
+| Nuxt 3 routes use file-based layout groups | Strip layout folders (e.g. `(auth)/`) from path conversion the same way Next.js route groups are handled. |
+| Scan finds 0 hydration errors across all routes | Report clean with route count. Note that dynamic data (authenticated content, real-time data) may behave differently in production and suggest testing with `HEADLESS=false` and real session cookies if confidence is needed. |
