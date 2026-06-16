@@ -228,7 +228,7 @@ After the app is clean, suggest adding to CI:
 | Route requires auth | Skip it in scan mode and list it as "skipped — requires login". Offer to add cookie injection if the user wants it audited. |
 | Route has a dynamic segment e.g. `/post/[id]` | Substitute a real ID if the user can provide one; otherwise substitute `1` and note the assumption in the report. |
 | No hydration errors but visual flash reported | Run with `VERBOSE=1` — silent mismatches show in the DOM diff even without a console error. Also check for `suppressHydrationWarning` prop hiding errors. |
-| `suppressHydrationWarning` found in codebase | Flag every instance in the report. This prop hides mismatches rather than fixing them — each use should be reviewed. |
+| `suppressHydrationWarning` found in codebase | Flag every instance in the report. This prop hides mismatches rather than fixing them — each use should be reviewed. **Note: React never logs this string at runtime — when suppression works, the console is completely silent. The script detects it by scanning source files before the browser launches, not by watching console output.** |
 | Browser extension modifies DOM | The diff will show changes not attributable to any component. Note in the report that extensions can cause false positives and suggest running in an Incognito window. |
 | Nuxt 3 routes use file-based layout groups | Strip layout folders (e.g. `(auth)/`) from path conversion the same way Next.js route groups are handled. |
 | Scan finds 0 hydration errors across all routes | Report clean with route count. Note that dynamic data (authenticated content, real-time data) may behave differently in production and suggest testing with `HEADLESS=false` and real session cookies if confidence is needed. |

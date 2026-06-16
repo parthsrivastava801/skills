@@ -17,6 +17,8 @@
  */
 
 import { chromium } from 'playwright';
+import { readFileSync, readdirSync, statSync } from 'fs';
+import { join } from 'path';
 
 // ─── CONFIG — edit these values only ─────────────────────────────────────────
 const CONFIG = {
@@ -65,7 +67,50 @@ const HYDRATION_PATTERNS = {
   ],
 };
 
-// Strips framework noise so diffs reflect real content differences only.
+// ─── Source-level suppressHydrationWarning scanner ───────────────────────────
+// React never logs "suppressHydrationWarning" to the console — when it works,
+// it silences everything. The only reliable way to find it is to grep the
+// source files directly before any browser session starts.
+function findSuppressWarnings(projectRoot = '.') {
+  const results   = [];
+  const EXTS      = ['.tsx', '.jsx', '.ts', '.js', '.vue', '.svelte'];
+  const SKIP_DIRS = ['node_modules', '.next', '.nuxt', '.svelte-kit',
+                     'dist', 'build', 'out', '.git', 'coverage'];
+
+  function scan(dir) {
+    let entries;
+    try { entries = readdirSync(dir); } catch { return; }
+
+    for (const entry of entries) {
+      if (SKIP_DIRS.includes(entry)) continue;
+      const fullPath = join(dir, entry);
+      let stat;
+      try { stat = statSync(fullPath); } catch { continue; }
+
+      if (stat.isDirectory()) {
+        scan(fullPath);
+      } else if (EXTS.some(ext => entry.endsWith(ext))) {
+        try {
+          const lines = readFileSync(fullPath, 'utf8').split('\n');
+          lines.forEach((line, i) => {
+            if (line.includes('suppressHydrationWarning')) {
+              results.push({
+                file: fullPath.replace(process.cwd() + '/', ''),
+                line: i + 1,
+                snippet: line.trim().slice(0, 120),
+              });
+            }
+          });
+        } catch { /* skip unreadable files */ }
+      }
+    }
+  }
+
+  scan(projectRoot);
+  return results;
+}
+
+
 function normalise(html, framework) {
   let out = html;
 
@@ -115,15 +160,9 @@ async function checkRoute(browser, route) {
   const patterns = HYDRATION_PATTERNS[CONFIG.framework] || HYDRATION_PATTERNS.other;
 
   const hydrationErrors = [];
-  const suppressWarnings = [];
 
   page.on('console', msg => {
     const text = msg.text();
-
-    // Catch suppressHydrationWarning usage
-    if (text.includes('suppressHydrationWarning')) {
-      suppressWarnings.push(text.slice(0, 300));
-    }
 
     // Match hydration error patterns
     const isHydrationIssue = patterns.some(p =>
@@ -160,14 +199,14 @@ async function checkRoute(browser, route) {
       skipped    = true;
       skipReason = `requires auth (HTTP ${response.status()})`;
       await ctx.close();
-      return { url, route, clean: true, skipped, skipReason, errors: [], suppressWarnings, hasDiff: false, diffSize: 0 };
+      return { url, route, clean: true, skipped, skipReason, errors: [], hasDiff: false, diffSize: 0 };
     }
 
     if (!response.ok() && response.status() !== 404) {
       skipped    = true;
       skipReason = `server returned ${response.status()}`;
       await ctx.close();
-      return { url, route, clean: true, skipped, skipReason, errors: [], suppressWarnings, hasDiff: false, diffSize: 0 };
+      return { url, route, clean: true, skipped, skipReason, errors: [], hasDiff: false, diffSize: 0 };
     }
 
     serverHTML = await page.content();
@@ -187,7 +226,7 @@ async function checkRoute(browser, route) {
       skipReason = `timeout or load error: ${err.message.slice(0, 100)}`;
     }
     await ctx.close();
-    return { url, route, clean: true, skipped, skipReason, errors: [], suppressWarnings, hasDiff: false, diffSize: 0 };
+    return { url, route, clean: true, skipped, skipReason, errors: [], hasDiff: false, diffSize: 0 };
   }
 
   // Structural diff
@@ -221,14 +260,13 @@ async function checkRoute(browser, route) {
     skipped: false,
     skipReason: '',
     errors: hydrationErrors,
-    suppressWarnings,
     hasDiff,
     diffSize,
   };
 }
 
 // ─── Report ───────────────────────────────────────────────────────────────────
-function printReport(results) {
+function printReport(results, suppressFindings = []) {
   const LINE  = '═'.repeat(56);
   const line2 = '─'.repeat(56);
   const time  = new Date().toISOString().replace('T', ' ').split('.')[0] + ' UTC';
@@ -276,11 +314,6 @@ function printReport(results) {
       console.log('  Run with VERBOSE=1 to see the raw diff.\n');
     }
 
-    if (r.suppressWarnings.length > 0) {
-      console.log(`  ⚠️  suppressHydrationWarning found (${r.suppressWarnings.length} instance(s))`);
-      console.log('  This hides mismatches rather than fixing them. Review each use.\n');
-    }
-
     if (i < issues.length - 1) console.log(line2);
   });
 
@@ -296,11 +329,30 @@ function printReport(results) {
     skipped.forEach(r => console.log(`    ${r.route}  (${r.skipReason})`));
   }
 
+  // ── suppressHydrationWarning — always a separate static-scan section ─────
+  // React never logs this string at runtime. When suppression works, the
+  // console is completely silent. The only way to find it is to grep source
+  // files — which is what findSuppressWarnings() does before any browser runs.
+  if (suppressFindings.length > 0) {
+    console.log('\n' + line2);
+    console.log(`⚠️   suppressHydrationWarning found in source (${suppressFindings.length} instance(s))`);
+    console.log('  React does not log this at runtime — when it works, the console');
+    console.log('  is completely silent. Each instance hides a mismatch instead of');
+    console.log('  fixing it. Review every use and replace with a proper fix.\n');
+    suppressFindings.forEach(f => {
+      console.log(`  ${f.file}:${f.line}`);
+      console.log(`    ${f.snippet}`);
+    });
+  }
+
   console.log('\n' + LINE);
   const passed = issues.length === 0;
   console.log(`  RESULT: ${passed
     ? '✅  ALL CLEAN'
     : `❌  ${issues.length} ROUTE(S) HAVE HYDRATION ISSUES`}`);
+  if (suppressFindings.length > 0) {
+    console.log(`  ⚠️   ${suppressFindings.length} suppressed mismatch(es) found in source — see above`);
+  }
   console.log(LINE + '\n');
 
   return passed;
@@ -319,7 +371,18 @@ async function main() {
 
   console.log(`\n🔍 SSR Hydration Watchdog — ${modeLabel}`);
   console.log(`   Base URL  : ${CONFIG.baseUrl}`);
-  console.log(`   Framework : ${CONFIG.framework}\n`);
+  console.log(`   Framework : ${CONFIG.framework}`);
+
+  // ── Static scan first — must happen before any browser launch ──────────────
+  // React never logs "suppressHydrationWarning" to the console.
+  // When suppression works, the console is completely silent — runtime
+  // detection is impossible. Grep the source files directly instead.
+  process.stdout.write('   Scanning source for suppressHydrationWarning...');
+  const suppressFindings = findSuppressWarnings('.');
+  console.log(suppressFindings.length > 0
+    ? ` ⚠️  found ${suppressFindings.length} instance(s)`
+    : ' ✅ none found');
+  console.log();
 
   let browser;
   try {
@@ -342,7 +405,7 @@ async function main() {
 
   await browser.close();
 
-  const passed = printReport(results);
+  const passed = printReport(results, suppressFindings);
   process.exit(passed ? 0 : 1);
 }
 
